@@ -10,6 +10,7 @@ import { Session, getSession } from './session.js';
 import { sttHealth, warmStt } from './transcribe.js';
 import { llmHealth, llmLabel } from './llm.js';
 import { formatDuration } from './utils.js';
+import { getUserDelivery, setUserDelivery } from './userConfig.js';
 
 assertConfig();
 
@@ -66,6 +67,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'join') await handleJoin(interaction);
     else if (interaction.commandName === 'leave') await handleLeave(interaction);
     else if (interaction.commandName === 'status') await handleStatus(interaction);
+    else if (interaction.commandName === 'config') await handleConfig(interaction);
   } catch (err) {
     console.error(`[bot] /${interaction.commandName} failed:`, err);
     const msg = `Something went wrong: ${err.message}`;
@@ -121,13 +123,17 @@ async function handleJoin(interaction) {
     });
   }
 
-  await interaction.deferReply();
+  const { mode: deliveryMode, channelId: deliveryChannelId } = await resolveDelivery(interaction);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const session = new Session({
     guild,
     voiceChannel: channel,
     textChannel: interaction.channel,
     requester: interaction.user,
+    deliveryMode,
+    deliveryChannelId,
   });
   attachProgress(session);
 
@@ -143,9 +149,45 @@ async function handleJoin(interaction) {
   // the first utterance instead — slower, but nothing is dropped.
   await Promise.all([session.start(), warmStt()]);
 
+  // The command reply below is ephemeral (visible only to whoever ran /join),
+  // so this public line is the room's only notice that recording has started.
+  await interaction.channel
+    .send(`🔴 **${interaction.user} started taking notes in ${channel}.**`)
+    .catch(() => {});
+
   await interaction.editReply(
-    `🔴 **Now taking notes in ${channel}.** Run \`/leave\` when you're done.`
+    `🔴 **Now taking notes in ${channel}.** Run \`/leave\` when you're done. ` +
+      `Notes delivery: ${describeDelivery(deliveryMode, deliveryChannelId)}.`
   );
+}
+
+/**
+ * Work out how notes should be delivered for this session: an explicit
+ * `/join delivery:` flag wins, otherwise fall back to the caller's saved
+ * `/config` default (and finally "DM me").
+ */
+async function resolveDelivery(interaction) {
+  const modeOpt = interaction.options.getString('delivery');
+  const channelOpt = interaction.options.getChannel('delivery-channel');
+
+  if (modeOpt) {
+    return {
+      mode: modeOpt,
+      channelId: modeOpt === 'channel' ? channelOpt?.id ?? interaction.channel.id : null,
+    };
+  }
+
+  const saved = await getUserDelivery(interaction.guild.id, interaction.user.id);
+  if (saved.mode === 'channel' && !saved.channelId) {
+    return { mode: 'channel', channelId: interaction.channel.id };
+  }
+  return saved;
+}
+
+function describeDelivery(mode, channelId) {
+  if (mode === 'everyone') return "DM'd to everyone who spoke";
+  if (mode === 'channel') return `posted in <#${channelId}>`;
+  return 'DM to you';
 }
 
 async function handleLeave(interaction) {
@@ -157,7 +199,7 @@ async function handleLeave(interaction) {
     });
   }
 
-  await interaction.deferReply();
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   await interaction.editReply(
     `📝 Wrapping up — follow along above. Writing notes with ${llmLabel()}.`
   );
@@ -166,9 +208,7 @@ async function handleLeave(interaction) {
 
   const summary =
     `✅ **Notes ready.** ${describe(result.stats)}\n` +
-    (result.delivered
-      ? `Sent to ${session.requester} by DM.`
-      : `I couldn't DM ${session.requester} (their DMs are closed), so here they are:`);
+    (result.delivered ? result.deliverySummary : `${result.deliverySummary} Here they are:`);
 
   await interaction
     .editReply({ content: summary, files: result.delivered ? [] : [result.attachment()] })
@@ -179,6 +219,29 @@ async function handleLeave(interaction) {
         files: result.delivered ? [] : [result.attachment()],
       });
     });
+}
+
+async function handleConfig(interaction) {
+  const mode = interaction.options.getString('delivery', true);
+  const channel = interaction.options.getChannel('delivery-channel');
+
+  if (mode === 'channel' && !channel) {
+    return interaction.reply({
+      content:
+        'Pick a channel with `delivery-channel:#some-channel` when delivery is "Post in a channel".',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await setUserDelivery(interaction.guild.id, interaction.user.id, {
+    mode,
+    channelId: mode === 'channel' ? channel.id : null,
+  });
+
+  await interaction.reply({
+    content: `✅ Default notes delivery updated: ${describeDelivery(mode, channel?.id)}.`,
+    flags: MessageFlags.Ephemeral,
+  });
 }
 
 async function handleStatus(interaction) {
@@ -216,38 +279,73 @@ async function handleStatus(interaction) {
 }
 
 /**
- * Stop the session, write the notes, and DM them to whoever started it.
- * `reason` is set when we're finalising because something went wrong.
+ * Stop the session, write the notes, and deliver them per the session's
+ * configured mode (DM the requester, DM everyone who spoke, or post in a
+ * channel). `reason` is set when we're finalising because something went wrong.
  */
 async function finalise(session, fallbackChannel, reason) {
   const { filePath, stats } = await session.stop();
-  session.onProgress('📄 Notes ready — sending by DM');
   const filename = `${session.slug}.md`;
   const attachment = () => new AttachmentBuilder(filePath, { name: filename });
+  const prefix = reason ? `⚠️ ${reason}, so I wrapped up early.\n\n` : '';
+  const header = `📄 **Notes from ${session.voiceChannel.name}** — ${describe(stats)}`;
 
   let delivered = false;
-  try {
-    await session.requester.send({
-      content:
-        (reason ? `⚠️ ${reason}, so I wrapped up early.\n\n` : '') +
-        `📄 **Notes from ${session.voiceChannel.name}** — ${describe(stats)}`,
-      files: [attachment()],
-    });
-    delivered = true;
-  } catch {
-    console.warn(`[bot] could not DM ${session.requester.tag}; DMs are probably closed`);
+  let deliverySummary = '';
+
+  if (session.deliveryMode === 'channel') {
+    session.onProgress(`📄 Notes ready — posting in <#${session.deliveryChannelId}>`);
+    const target =
+      (session.deliveryChannelId &&
+        (await session.guild.channels.fetch(session.deliveryChannelId).catch(() => null))) ||
+      fallbackChannel;
+    try {
+      await target.send({ content: `${prefix}${header}`, files: [attachment()] });
+      delivered = true;
+      deliverySummary = `Posted in ${target}.`;
+    } catch {
+      console.warn(`[bot] could not post notes in configured channel for guild ${session.guild.id}`);
+      deliverySummary = "I couldn't post in the configured channel, so here they are:";
+    }
+  } else if (session.deliveryMode === 'everyone') {
+    session.onProgress('📄 Notes ready — sending by DM to everyone who spoke');
+    const recipients = [...session.speakers.keys()];
+    let sent = 0;
+    for (const userId of recipients) {
+      try {
+        const member = await session.guild.members.fetch(userId);
+        await member.send({ content: `${prefix}${header}`, files: [attachment()] });
+        sent += 1;
+      } catch {
+        console.warn(`[bot] could not DM participant ${userId}; DMs are probably closed`);
+      }
+    }
+    delivered = sent > 0;
+    deliverySummary = recipients.length
+      ? `DM'd ${sent}/${recipients.length} participant(s).`
+      : "No participants were detected, so I couldn't DM anyone. Here they are:";
+  } else {
+    session.onProgress('📄 Notes ready — sending by DM');
+    try {
+      await session.requester.send({ content: `${prefix}${header}`, files: [attachment()] });
+      delivered = true;
+      deliverySummary = `Sent to ${session.requester} by DM.`;
+    } catch {
+      console.warn(`[bot] could not DM ${session.requester.tag}; DMs are probably closed`);
+      deliverySummary = `I couldn't DM ${session.requester} (their DMs are closed), so here they are:`;
+    }
   }
 
   if (!delivered && reason && fallbackChannel) {
     await fallbackChannel
       .send({
-        content: `⚠️ ${reason}. ${session.requester}, I couldn't DM you — notes attached.`,
+        content: `⚠️ ${reason}. ${session.requester}, I couldn't deliver the notes as configured — attached.`,
         files: [attachment()],
       })
       .catch(() => {});
   }
 
-  return { filePath, stats, delivered, attachment };
+  return { filePath, stats, delivered, deliverySummary, attachment };
 }
 
 const describe = (stats) =>

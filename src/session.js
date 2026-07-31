@@ -33,11 +33,13 @@ export class Session {
   #sectionFailures = 0;
   #sectionQueue = new SerialQueue();
 
-  constructor({ guild, voiceChannel, textChannel, requester }) {
+  constructor({ guild, voiceChannel, textChannel, requester, deliveryMode, deliveryChannelId }) {
     this.guild = guild;
     this.voiceChannel = voiceChannel;
     this.textChannel = textChannel;
     this.requester = requester;
+    this.deliveryMode = deliveryMode || 'me';
+    this.deliveryChannelId = deliveryChannelId || null;
 
     this.startedAt = Date.now();
     this.utterances = [];

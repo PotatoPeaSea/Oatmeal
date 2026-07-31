@@ -1,7 +1,8 @@
 # 🥣 Oatmeal — local AI meeting notes for Discord
 
-A Discord bot that joins a voice channel, transcribes the conversation, and DMs
-markdown meeting notes to whoever asked it to join.
+A Discord bot that joins a voice channel, transcribes the conversation, and
+delivers markdown meeting notes — by DM to whoever asked it to join (default),
+by DM to everyone who spoke, or posted in a channel, configurable per user with `/config`.
 
 **Transcription is always local** — audio never leaves your machine. Note writing
 runs on either a cloud LLM (default) or a fully local one:
@@ -130,17 +131,26 @@ take a few seconds. Wait for `model ready` before starting a meeting.
 
 | Command | What it does |
 | --- | --- |
-| `/join` | Joins your current voice channel and starts taking notes. Optionally `/join channel:#some-vc`. |
-| `/leave` | Stops, writes the notes, and DMs them to whoever ran `/join`. |
+| `/join` | Joins your current voice channel and starts taking notes. Optionally `/join channel:#some-vc delivery:<mode> delivery-channel:#some-channel`. Replies privately to you; the room only sees a short "started taking notes" line. |
+| `/leave` | Stops, writes the notes, and delivers them per the active delivery mode. Replies privately to you. |
 | `/status` | Shows the active session plus whether Whisper and Ollama are reachable. |
+| `/config` | Sets your default notes delivery for this server: `delivery:<mode>` (and `delivery-channel:` if the mode is "Post in a channel"). |
+
+**Delivery modes** (`me` / `everyone` / `channel`, picked via `/config` and
+overridable per-meeting with `/join delivery:`):
+- **DM me only** (default) — notes go by DM to whoever ran `/join`.
+- **DM everyone who spoke** — notes go by DM to every participant who was heard talking.
+- **Post in a channel** — notes are posted (with the file attached) in the channel you set with `delivery-channel:`.
+
+Defaults are saved per user, per server, in `data/user-config.json`.
 
 Notes are also saved to `notes/` locally. The bot wraps up on its own if everyone
 leaves the call or the voice connection drops, so a crashed meeting still produces
 notes.
 
-**If the DM doesn't arrive:** Discord silently blocks DMs from bots when
-*Settings → Privacy & Safety → Direct Messages* is off for that server. The bot
-detects this and posts the file in the channel instead.
+**If a DM doesn't arrive:** Discord silently blocks DMs from bots when
+*Settings → Privacy & Safety → Direct Messages* is off for that server. When
+that happens the notes are posted/attached instead of silently disappearing.
 
 ### What the notes look like
 
@@ -287,10 +297,12 @@ install CUDA libraries.
 
 ## Consent
 
-This bot transcribes people. `/join` posts a visible "Now taking notes" message in
-the channel it was invoked from, but that is the only notice — participants who
-join later, or who are in the voice channel without watching that text channel,
-get no explicit warning beyond seeing the bot present.
+This bot transcribes people. `/join` posts a visible "started taking notes"
+message in the channel it was invoked from, but that is the only notice —
+participants who join later, or who are in the voice channel without watching
+that text channel, get no explicit warning beyond seeing the bot present. (The
+detailed confirmation and delivery-mode summary, by contrast, are only visible
+to whoever ran the command.)
 
 Recording without telling participants is illegal in two-party-consent
 jurisdictions, so telling the room is on you. If you want a louder notice, the
