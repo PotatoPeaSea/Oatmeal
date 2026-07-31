@@ -1,0 +1,10 @@
+faster-whisper==1.2.1
+fastapi==0.141.1
+uvicorn==0.40.0
+python-multipart==0.0.20
+
+# CUDA 12 runtime libs for CTranslate2 (the engine under faster-whisper).
+# Needed on Windows for GPU inference; harmless to install on a CPU-only box,
+# where server.py falls back to int8 on CPU automatically.
+nvidia-cublas-cu12==12.9.1.4
+nvidia-cudnn-cu12==9.13.1.26
