@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import {
   joinVoiceChannel,
@@ -33,6 +34,7 @@ export class Session {
   #sectionCount = 0;
   #sectionFailures = 0;
   #sectionQueue = new SerialQueue();
+  #liveTimer = null;
 
   constructor({
     guild,
@@ -69,6 +71,12 @@ export class Session {
     const stamp = new Date(this.startedAt).toISOString().replace(/[:.]/g, '-').slice(0, 19);
     this.slug = `${stamp}_${safeFilename(voiceChannel.name)}`;
     this.audioDir = path.join(config.recordingsDir, this.slug);
+
+    // Mirrors progress to the OS temp dir so an in-progress meeting can be
+    // inspected (e.g. `tail -f`) without waiting for /leave. Purely a live
+    // view — wiped in stop(), never treated as a source of truth.
+    this.liveDir = path.join(os.tmpdir(), 'oatmeal-live', this.slug);
+    this.liveSectionsDir = path.join(this.liveDir, 'sections');
   }
 
   nextUtteranceSeq() {
@@ -94,6 +102,7 @@ export class Session {
 
   async start() {
     await ensureDir(this.audioDir);
+    await ensureDir(this.liveSectionsDir); // recursive mkdir also creates liveDir
 
     this.connection = joinVoiceChannel({
       channelId: this.voiceChannel.id,
@@ -121,8 +130,27 @@ export class Session {
     await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
 
     this.detach = startCapture(this, (utt) => this.ingestUtterance(utt));
+
+    this.#liveTimer = setInterval(() => {
+      this.#writeLiveTranscript().catch((err) =>
+        console.error(`[live] transcript write failed: ${err.message}`)
+      );
+    }, 30_000);
+    this.#liveTimer.unref?.();
+
     sessions.set(this.guild.id, this);
     return this;
+  }
+
+  async #writeLiveTranscript() {
+    const transcript = this.buildTranscript();
+    if (!transcript.trim()) return;
+    await fs.writeFile(path.join(this.liveDir, 'transcript.txt'), transcript, 'utf8');
+  }
+
+  async #writeLiveSection(index, summary) {
+    const file = path.join(this.liveSectionsDir, `section-${String(index).padStart(3, '0')}.md`);
+    await fs.writeFile(file, summary, 'utf8');
   }
 
   /**
@@ -185,6 +213,9 @@ export class Session {
       try {
         const summary = await summariseSection({ chunk, context: this.#context(), index });
         this.#sections.push(summary);
+        await this.#writeLiveSection(index, summary).catch((err) =>
+          console.error(`[live] section ${index} write failed: ${err.message}`)
+        );
         this.onProgress(`✅ Section ${index} finished summarizing`);
       } catch (err) {
         // Losing a section would silently drop that slice of the meeting, so
@@ -228,6 +259,7 @@ export class Session {
   async stop() {
     this.stopping = true;
     this.detach?.();
+    if (this.#liveTimer) clearInterval(this.#liveTimer);
 
     try {
       this.connection?.destroy();
@@ -311,6 +343,9 @@ export class Session {
     if (!config.keepAudio) {
       await fs.rm(this.audioDir, { recursive: true, force: true }).catch(() => {});
     }
+    // Always temporary, regardless of keepAudio — its only purpose was letting
+    // this meeting be watched live.
+    await fs.rm(this.liveDir, { recursive: true, force: true }).catch(() => {});
 
     return {
       filePath,
