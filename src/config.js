@@ -37,6 +37,20 @@ export const config = {
   openrouterUrl: (process.env.OPENROUTER_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, ''),
   openrouterModel: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free',
 
+  // Optional second cloud backend. Only used when OpenRouter rate-limits us —
+  // the free Nemotron endpoint is contended and returns ResourceExhausted under
+  // load, which would otherwise lose a whole meeting's notes. Leave the key
+  // blank to disable the fallback entirely.
+  geminiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
+  // "Gemini 3 Flash" on the AI Studio quota page, which is the only Gemini 3
+  // family model with a listed free allowance. Newer ids (gemini-3.6-flash)
+  // answer requests but do not appear in the free-tier quota at all.
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-3-flash-preview',
+  // Google's OpenAI-compatible surface, so the same request shape works.
+  geminiUrl: (
+    process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com/v1beta/openai'
+  ).replace(/\/$/, ''),
+
   silenceMs: Number(process.env.SILENCE_MS || 800),
   minUtteranceMs: Number(process.env.MIN_UTTERANCE_MS || 400),
   keepAudio: bool(process.env.KEEP_AUDIO, false),

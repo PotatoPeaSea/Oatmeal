@@ -13,10 +13,11 @@ import {
   generateNotes,
   summariseSection,
   supportsParallelSummarisation,
+  emptyNotes,
+  DEFAULT_FORMAT,
   SECTION_CHARS,
 } from './notes.js';
 import { releaseLlm, llmLabel } from './llm.js';
-import { createSpeakerMap } from './pseudonymise.js';
 import { ensureDir, safeFilename, formatDuration, formatOffset, SerialQueue } from './utils.js';
 
 /** guildId -> Session. One meeting per server at a time, which matches Discord's own limit. */
@@ -33,13 +34,22 @@ export class Session {
   #sectionFailures = 0;
   #sectionQueue = new SerialQueue();
 
-  constructor({ guild, voiceChannel, textChannel, requester, deliveryMode, deliveryChannelId }) {
+  constructor({
+    guild,
+    voiceChannel,
+    textChannel,
+    requester,
+    deliveryMode,
+    deliveryChannelId,
+    format,
+  }) {
     this.guild = guild;
     this.voiceChannel = voiceChannel;
     this.textChannel = textChannel;
     this.requester = requester;
     this.deliveryMode = deliveryMode || 'me';
     this.deliveryChannelId = deliveryChannelId || null;
+    this.format = format || DEFAULT_FORMAT;
 
     this.startedAt = Date.now();
     this.utterances = [];
@@ -55,9 +65,6 @@ export class Session {
     // meeting can overlap with transcribing the later parts. In local mode both
     // models want the same GPU, so they are strictly sequenced instead.
     this.parallelSummaries = supportsParallelSummarisation();
-    // One map for the whole meeting so a section summarised in minute 5 uses
-    // the same aliases as the consolidation pass at the end.
-    this.speakerMap = createSpeakerMap();
 
     const stamp = new Date(this.startedAt).toISOString().replace(/[:.]/g, '-').slice(0, 19);
     this.slug = `${stamp}_${safeFilename(voiceChannel.name)}`;
@@ -176,12 +183,7 @@ export class Session {
 
     this.#sectionQueue.add(async () => {
       try {
-        const summary = await summariseSection({
-          chunk,
-          context: this.#context(),
-          index,
-          speakers: this.speakerMap,
-        });
+        const summary = await summariseSection({ chunk, context: this.#context(), index });
         this.#sections.push(summary);
         this.onProgress(`✅ Section ${index} finished summarizing`);
       } catch (err) {
@@ -249,9 +251,7 @@ export class Session {
 
     let body;
     if (!transcript.trim()) {
-      body =
-        '## Summary\n\n' +
-        '_No speech was captured during this meeting, so there is nothing to summarise._\n';
+      body = emptyNotes(this.format);
     } else {
       // Finish any rolling section work started during the meeting.
       let sections = [];
@@ -274,7 +274,7 @@ export class Session {
           title,
           participants,
           sections,
-          speakers: this.speakerMap,
+          format: this.format,
           onProgress: (t) => this.onProgress(t),
         });
       } else {
@@ -287,7 +287,7 @@ export class Session {
             transcript,
             title,
             participants,
-            speakers: this.speakerMap,
+            format: this.format,
             onProgress: (t) => this.onProgress(t),
           });
         } finally {
@@ -327,16 +327,10 @@ export class Session {
   }
 
   #assemble({ body, transcript, participants, durationMs, failed }) {
-    const started = new Date(this.startedAt);
     const header = [
-      `# Meeting Notes — ${this.voiceChannel.name}`,
-      '',
-      `- **Date:** ${started.toLocaleString()}`,
-      `- **Duration:** ${formatDuration(durationMs)}`,
-      `- **Voice channel:** #${this.voiceChannel.name}`,
-      `- **Participants:** ${participants.join(', ') || '_none detected_'}`,
-      `- **Requested by:** ${this.requester.username}`,
-      `- **Notes by:** ${llmLabel()}`,
+      ...(this.format === 'minutes'
+        ? this.#minutesHeading({ participants, durationMs })
+        : this.#standardHeading({ participants, durationMs })),
       '',
       // Never let a broken transcription service masquerade as a quiet meeting.
       ...(failed
@@ -356,6 +350,44 @@ export class Session {
       : '';
 
     return header + body.trim() + '\n' + footer;
+  }
+
+  #standardHeading({ participants, durationMs }) {
+    return [
+      `# Meeting Notes — ${this.voiceChannel.name}`,
+      '',
+      `- **Date:** ${new Date(this.startedAt).toLocaleString()}`,
+      `- **Duration:** ${formatDuration(durationMs)}`,
+      `- **Voice channel:** #${this.voiceChannel.name}`,
+      `- **Participants:** ${participants.join(', ') || '_none detected_'}`,
+      `- **Requested by:** ${this.requester.username}`,
+      `- **Notes by:** ${llmLabel()}`,
+    ];
+  }
+
+  /**
+   * The minutes format opens with the template's title + Overview block. It is
+   * built here rather than asked of the model because every field in it is
+   * something we know exactly and the model would have to guess at.
+   */
+  #minutesHeading({ participants, durationMs }) {
+    const date = new Date(this.startedAt).toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    });
+    return [
+      `# ${date} | ${this.voiceChannel.name.toUpperCase()}`,
+      '',
+      '## Overview',
+      '',
+      `- **Date:** ${date}`,
+      `- **Duration:** ${formatDuration(durationMs)}`,
+      `- **Attendees:** ${participants.join(', ') || '_none detected_'}`,
+      `- **Location/Link:** Discord voice — #${this.voiceChannel.name}`,
+      `- **Requested by:** ${this.requester.username}`,
+      `- **Notes by:** ${llmLabel()}`,
+    ];
   }
 }
 

@@ -10,7 +10,8 @@ import { Session, getSession } from './session.js';
 import { sttHealth, warmStt } from './transcribe.js';
 import { llmHealth, llmLabel } from './llm.js';
 import { formatDuration } from './utils.js';
-import { getUserDelivery, setUserDelivery } from './userConfig.js';
+import { formatLabel } from './notes.js';
+import { getUserPrefs, setUserPrefs } from './userConfig.js';
 
 assertConfig();
 
@@ -123,7 +124,11 @@ async function handleJoin(interaction) {
     });
   }
 
-  const { mode: deliveryMode, channelId: deliveryChannelId } = await resolveDelivery(interaction);
+  const {
+    mode: deliveryMode,
+    channelId: deliveryChannelId,
+    format,
+  } = await resolvePrefs(interaction);
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -134,6 +139,7 @@ async function handleJoin(interaction) {
     requester: interaction.user,
     deliveryMode,
     deliveryChannelId,
+    format,
   });
   attachProgress(session);
 
@@ -157,31 +163,37 @@ async function handleJoin(interaction) {
 
   await interaction.editReply(
     `🔴 **Now taking notes in ${channel}.** Run \`/leave\` when you're done. ` +
-      `Notes delivery: ${describeDelivery(deliveryMode, deliveryChannelId)}.`
+      `Notes delivery: ${describeDelivery(deliveryMode, deliveryChannelId)}. ` +
+      `Format: **${formatLabel(format)}**.`
   );
 }
 
 /**
- * Work out how notes should be delivered for this session: an explicit
- * `/join delivery:` flag wins, otherwise fall back to the caller's saved
- * `/config` default (and finally "DM me").
+ * Work out how notes should be delivered and written for this session: an
+ * explicit `/join delivery:` / `/join format:` flag wins, otherwise fall back to
+ * the caller's saved `/config` defaults (and finally "DM me", "Standard").
  */
-async function resolveDelivery(interaction) {
+async function resolvePrefs(interaction) {
   const modeOpt = interaction.options.getString('delivery');
   const channelOpt = interaction.options.getChannel('delivery-channel');
+  const formatOpt = interaction.options.getString('format');
+
+  const saved = await getUserPrefs(interaction.guild.id, interaction.user.id);
+  const format = formatOpt ?? saved.format;
 
   if (modeOpt) {
     return {
       mode: modeOpt,
       channelId: modeOpt === 'channel' ? channelOpt?.id ?? interaction.channel.id : null,
+      format,
     };
   }
 
-  const saved = await getUserDelivery(interaction.guild.id, interaction.user.id);
-  if (saved.mode === 'channel' && !saved.channelId) {
-    return { mode: 'channel', channelId: interaction.channel.id };
-  }
-  return saved;
+  // A saved "post in a channel" default with no channel means the channel was
+  // deleted, or the default predates the option; fall back to the current one.
+  const channelId =
+    saved.mode === 'channel' ? saved.channelId ?? interaction.channel.id : saved.channelId;
+  return { mode: saved.mode, channelId, format };
 }
 
 function describeDelivery(mode, channelId) {
@@ -222,8 +234,22 @@ async function handleLeave(interaction) {
 }
 
 async function handleConfig(interaction) {
-  const mode = interaction.options.getString('delivery', true);
+  const mode = interaction.options.getString('delivery');
   const channel = interaction.options.getChannel('delivery-channel');
+  const format = interaction.options.getString('format');
+
+  // Both options are optional so either can be changed alone; with neither,
+  // show what is currently saved rather than silently doing nothing.
+  if (!mode && !format) {
+    const saved = await getUserPrefs(interaction.guild.id, interaction.user.id);
+    return interaction.reply({
+      content:
+        `Your current defaults — delivery: ${describeDelivery(saved.mode, saved.channelId)}, ` +
+        `format: **${formatLabel(saved.format)}**.\n` +
+        'Change them with `/config delivery:` and/or `/config format:`.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
   if (mode === 'channel' && !channel) {
     return interaction.reply({
@@ -233,13 +259,19 @@ async function handleConfig(interaction) {
     });
   }
 
-  await setUserDelivery(interaction.guild.id, interaction.user.id, {
-    mode,
-    channelId: mode === 'channel' ? channel.id : null,
-  });
+  const patch = {};
+  if (mode) Object.assign(patch, { mode, channelId: mode === 'channel' ? channel.id : null });
+  if (format) patch.format = format;
+
+  const saved = await setUserPrefs(interaction.guild.id, interaction.user.id, patch);
+
+  const changed = [
+    ...(mode ? [`delivery: ${describeDelivery(saved.mode, saved.channelId)}`] : []),
+    ...(format ? [`format: **${formatLabel(saved.format)}**`] : []),
+  ];
 
   await interaction.reply({
-    content: `✅ Default notes delivery updated: ${describeDelivery(mode, channel?.id)}.`,
+    content: `✅ Defaults updated — ${changed.join(', ')}.`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -255,6 +287,7 @@ async function handleStatus(interaction) {
       ? `🔴 **Recording** in ${session.voiceChannel} for ${formatDuration(Date.now() - session.startedAt)}\n` +
         `• Started by ${session.requester}\n` +
         `• ${session.transcribedCount} utterance(s) transcribed, ${session.queue.pending} in the queue\n` +
+        `• Format: ${formatLabel(session.format)} — ${describeDelivery(session.deliveryMode, session.deliveryChannelId)}\n` +
         `• Speakers so far: ${[...session.speakers.values()].join(', ') || 'none yet'}` +
         (session.parallelSummaries
           ? `\n• Rolling summaries: ${session.sectionsDone}/${session.sectionsStarted} section(s) done`

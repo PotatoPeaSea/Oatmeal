@@ -87,25 +87,93 @@ async function openrouterChat(messages, { temperature, signal }) {
   }
 
   const data = await res.json();
-  // OpenRouter surfaces upstream provider failures in a 200 body.
-  if (data.error) throw new Error(`OpenRouter: ${data.error.message || JSON.stringify(data.error)}`);
+  // OpenRouter surfaces upstream provider failures in a 200 body, so the HTTP
+  // status alone doesn't tell us whether we were throttled.
+  if (data.error) {
+    const err = new Error(`OpenRouter: ${data.error.message || JSON.stringify(data.error)}`);
+    err.status = data.error.code;
+    throw err;
+  }
 
   const choice = data.choices?.[0];
   return stripThinking(choice?.message?.content || '');
 }
 
+/**
+ * Did this failure mean "come back later" rather than "you asked for something
+ * impossible"? The free Nemotron pool answers in several dialects: a plain 429,
+ * an OpenRouter body with `code: 429`, and a 200 carrying
+ * "Upstream error from Nvidia: ResourceExhausted: Worker local total request
+ * limit reached (32/32)".
+ */
+function isRateLimited(err) {
+  if (err?.status === 429 || err?.status === 503) return true;
+  return /rate.?limit|resourceexhausted|quota|too many requests|overloaded|capacity/i.test(
+    err?.message || ''
+  );
+}
+
+// -------------------------------------------------------- cloud fallback -----
+
+/**
+ * Google's OpenAI-compatible endpoint, used only when OpenRouter throttles us.
+ * Deliberately does not send `reasoning`: that field is OpenRouter's, and this
+ * surface rejects unknown parameters.
+ */
+async function geminiChat(messages, { temperature, signal }) {
+  const res = await fetch(`${config.geminiUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${config.geminiKey}`,
+    },
+    body: JSON.stringify({ model: config.geminiModel, messages, temperature }),
+    signal: signal ?? AbortSignal.timeout(600_000),
+  });
+
+  if (!res.ok) {
+    const err = new Error(`Gemini returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const data = await res.json();
+  if (data.error) throw new Error(`Gemini: ${data.error.message || JSON.stringify(data.error)}`);
+  return stripThinking(data.choices?.[0]?.message?.content || '');
+}
+
 // --------------------------------------------------------------- shared -----
 
-/** Send a chat completion to whichever backend is configured. */
+/** Is a second cloud backend available to catch throttling? */
+export const hasFallback = () => isCloud() && Boolean(config.geminiKey);
+
+/**
+ * Send a chat completion to whichever backend is configured.
+ *
+ * In cloud mode a throttled request is retried once against Gemini rather than
+ * failing. A meeting costs several calls — every rolling section summary plus
+ * the consolidation — so on a contended free endpoint the odds of hitting the
+ * limit at least once are meaningful, and losing any one call loses notes.
+ */
 export async function llmChat(messages, { temperature = 0.3, numCtx = 16384, signal } = {}) {
-  return isCloud()
-    ? openrouterChat(messages, { temperature, signal })
-    : ollamaChat(messages, { temperature, numCtx, signal });
+  if (!isCloud()) return ollamaChat(messages, { temperature, numCtx, signal });
+
+  try {
+    return await openrouterChat(messages, { temperature, signal });
+  } catch (err) {
+    if (!hasFallback() || !isRateLimited(err)) throw err;
+    console.warn(`[llm] OpenRouter throttled (${err.message}) — falling back to ${config.geminiModel}`);
+    return geminiChat(messages, { temperature, signal });
+  }
 }
 
 /** Human-readable backend label for logs and /status. */
 export function llmLabel() {
-  return isCloud() ? `OpenRouter · ${config.openrouterModel}` : `Ollama · ${config.ollamaModel}`;
+  if (!isCloud()) return `Ollama · ${config.ollamaModel}`;
+  return (
+    `OpenRouter · ${config.openrouterModel}` +
+    (hasFallback() ? ` (fallback: ${config.geminiModel})` : '')
+  );
 }
 
 /**
@@ -154,12 +222,13 @@ export async function llmHealth(timeoutMs = 5000) {
       const data = await res.json();
       const limit = data?.data?.limit;
       const used = data?.data?.usage;
+      // The fallback only catches throttling, never a bad key, so it does not
+      // make an unhealthy primary healthy — it is reported, not counted.
       return {
         ok: true,
         detail:
-          limit == null
-            ? 'key valid (no credit limit)'
-            : `key valid (${used ?? 0}/${limit} used)`,
+          (limit == null ? 'key valid (no credit limit)' : `key valid (${used ?? 0}/${limit} used)`) +
+          (hasFallback() ? `; ${config.geminiModel} standing by for rate limits` : ''),
       };
     } catch (err) {
       return { ok: false, detail: err.message };

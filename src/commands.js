@@ -1,4 +1,5 @@
 import { SlashCommandBuilder, ChannelType } from 'discord.js';
+import { NOTE_FORMATS } from './notes.js';
 
 // Stage channels are deliberately excluded: the bot would join as audience and
 // receive no audio, which looks like a silent failure.
@@ -8,6 +9,13 @@ const DELIVERY_CHOICES = [
   { name: 'DM everyone who spoke', value: 'everyone' },
   { name: 'Post in a channel', value: 'channel' },
 ];
+
+// Discord caps choice names at 100 characters, which the descriptions stay well
+// under; they are joined so the picker explains each format without a lookup.
+const FORMAT_CHOICES = NOTE_FORMATS.map((f) => ({
+  name: `${f.label} — ${f.description}`.slice(0, 100),
+  value: f.value,
+}));
 
 export const commands = [
   new SlashCommandBuilder()
@@ -33,6 +41,13 @@ export const commands = [
         .setDescription('Channel to post notes in, used when delivery is "Post in a channel"')
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('format')
+        .setDescription('How the notes are written for this meeting (overrides your /config default)')
+        .setRequired(false)
+        .addChoices(...FORMAT_CHOICES)
     ),
 
   new SlashCommandBuilder()
@@ -45,12 +60,12 @@ export const commands = [
 
   new SlashCommandBuilder()
     .setName('config')
-    .setDescription('Set your default meeting-notes delivery for this server')
+    .setDescription('Set your meeting-notes defaults for this server (leave blank to see them)')
     .addStringOption((opt) =>
       opt
         .setName('delivery')
         .setDescription('Who should get the notes by default')
-        .setRequired(true)
+        .setRequired(false)
         .addChoices(...DELIVERY_CHOICES)
     )
     .addChannelOption((opt) =>
@@ -59,5 +74,12 @@ export const commands = [
         .setDescription('Channel to post notes in, required when delivery is "Post in a channel"')
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('format')
+        .setDescription('How the notes should be written by default')
+        .setRequired(false)
+        .addChoices(...FORMAT_CHOICES)
     ),
 ].map((c) => c.toJSON());
